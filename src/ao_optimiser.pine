@@ -1,0 +1,292 @@
+//@version=6
+indicator("AO Optimiser", "AO Optimiser", overlay=true, max_bars_back=5000)
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                             AO OPTIMISER                                     ║
+// ║                                                                              ║
+// ║  Sophisticated TradingView Pine Script v6 indicator for analyzing external   ║
+// ║  trading signals with statistical analysis and risk management, designed     ║
+// ║  for high-volume watchlist scanning.                                         ║
+// ║                                                                              ║
+// ║  Repository: https://github.com/andreoutberg/ao-optimiser-tradingview        ║
+// ║  Status: Initial Development Phase                                           ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                            EXTERNAL SIGNAL INGESTION                         │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// External Signal Input (Connector for External Indicators)
+external_signal = input.float(0, "External Signal", 
+     tooltip="Connect your external indicator here. Format: BUY=+1, SELL=-1, NO SIGNAL=0")
+
+// Signal Processing
+signal_direction = external_signal >= 1 ? 1 : external_signal <= -1 ? -1 : 0
+is_buy_signal = signal_direction == 1
+is_sell_signal = signal_direction == -1
+is_new_signal = signal_direction != 0 and signal_direction != signal_direction[1]
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                              FILTER SETTINGS                                 │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Critical Filter Settings for Watchlist Scanning
+tp1_min_profit = input.float(1.2, "TP1 Minimum Profit %", minval=0.1, maxval=10.0, step=0.1,
+     tooltip="Minimum required profit percentage for TP1")
+tp_success_threshold = input.int(90, "TP1 Success Rate %", minval=50, maxval=100, step=1,
+     tooltip="Minimum required hit rate for TP1 (default: 90%)")
+max_drawdown_limit = input.float(2.1, "Average Drawdown Limit %", minval=0.5, maxval=20.0, step=0.1,
+     tooltip="Maximum tolerable drawdown percentage")
+min_trade_history = input.int(50, "Minimum Trade History", minval=10, maxval=100, step=5,
+     tooltip="Minimum number of historical trades required for analysis")
+confidence_threshold = input.int(85, "Confidence Threshold %", minval=50, maxval=100, step=1,
+     tooltip="Minimum confidence level for signal validation")
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                           OPERATIONAL SETTINGS                               │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Entry and Risk Management
+entry_offset = input.float(0.1, "Entry Offset %", minval=0.0, maxval=2.0, step=0.1,
+     tooltip="Entry delay allowance (+0.1% offset for all calculations)")
+cooldown_period = input.int(24, "Cooldown Period (bars)", minval=1, maxval=168, step=1,
+     tooltip="Configurable bar-based cooldown (e.g., 24 bars = 24 hours on 1H)")
+
+// Alert Settings
+alerts_enabled = input.bool(true, "Enable Alerts", tooltip="Toggle alert system ON/OFF")
+alert_rate_limit = input.int(5, "Max Alerts per Hour", minval=1, maxval=20, step=1,
+     tooltip="Maximum alerts per hour across all assets (optional)")
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                            VARIABLE INITIALIZATION                           │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Clear, consistent naming for maintainability
+var float tp1_level = na
+var float tp2_level = na
+var float tp3_level = na
+var int total_trades = 0
+var int successful_trades = 0
+var float avg_drawdown_pct = 0.0
+var bool alerts_enabled_state = true
+var int cooldown_bars_remaining = 0
+
+// Trade Data Storage (Array-based for up to 100 trades)
+var array<float> trade_entry_prices = array.new<float>(0)
+var array<float> trade_tp1_levels = array.new<float>(0)
+var array<float> trade_tp2_levels = array.new<float>(0)
+var array<float> trade_tp3_levels = array.new<float>(0)
+var array<bool> trade_outcomes = array.new<bool>(0)
+var array<float> trade_drawdowns = array.new<float>(0)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                              CORE FUNCTIONS                                  │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Calculate TP Success Rate from Trade Data
+calc_tp_success_rate(trade_data) =>
+    if array.size(trade_data) == 0
+        0.0
+    else
+        successful_count = 0
+        for i = 0 to array.size(trade_data) - 1
+            if array.get(trade_data, i)
+                successful_count += 1
+        math.round(successful_count * 100 / array.size(trade_data), 1)
+
+// Validation Functions
+validate_signal_strength(confidence) =>
+    confidence >= confidence_threshold
+
+// Formatting Functions
+format_price_display(price) =>
+    str.format("{0}", price, format.mintick)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                          STATISTICAL CALCULATIONS                            │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Calculate TP Levels based on Historical Success Rates
+calculate_tp_levels(entry_price, is_long) =>
+    // TODO: Phase 2 implementation
+    // Will analyze historical success rates to determine optimal TP levels
+    base_tp1 = entry_price * (is_long ? 1.012 : 0.988) // 1.2% default
+    base_tp2 = entry_price * (is_long ? 1.025 : 0.975) // 2.5% default  
+    base_tp3 = entry_price * (is_long ? 1.050 : 0.950) // 5.0% default
+    [base_tp1, base_tp2, base_tp3]
+
+// Average Drawdown Calculation
+calculate_avg_drawdown() =>
+    if array.size(trade_drawdowns) == 0
+        0.0
+    else
+        total_dd = 0.0
+        for i = 0 to array.size(trade_drawdowns) - 1
+            total_dd += array.get(trade_drawdowns, i)
+        math.round(total_dd / array.size(trade_drawdowns), 1)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                             TRADE PROCESSING                                 │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Process New Signal
+if is_new_signal and cooldown_bars_remaining <= 0
+    entry_price = close * (1 + entry_offset / 100)
+    [calc_tp1, calc_tp2, calc_tp3] = calculate_tp_levels(entry_price, is_buy_signal)
+    
+    // Store trade data (limit to 100 trades for resource optimization)
+    if array.size(trade_entry_prices) >= 100
+        array.shift(trade_entry_prices)
+        array.shift(trade_tp1_levels)
+        array.shift(trade_tp2_levels) 
+        array.shift(trade_tp3_levels)
+        array.shift(trade_outcomes)
+        array.shift(trade_drawdowns)
+    
+    array.push(trade_entry_prices, entry_price)
+    array.push(trade_tp1_levels, calc_tp1)
+    array.push(trade_tp2_levels, calc_tp2)
+    array.push(trade_tp3_levels, calc_tp3)
+    array.push(trade_outcomes, false) // Will be updated when TP/SL hit
+    array.push(trade_drawdowns, 0.0)  // Will be calculated during trade
+    
+    total_trades += 1
+    cooldown_bars_remaining := cooldown_period
+
+// Update cooldown
+if cooldown_bars_remaining > 0
+    cooldown_bars_remaining -= 1
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                              FILTER SYSTEM                                   │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Three-Check Filter System (Critical for Watchlist Scanning)
+current_tp_success_rate = calc_tp_success_rate(trade_outcomes)
+current_avg_drawdown = calculate_avg_drawdown()
+
+// Filter Check 1: TP1 Success Rate
+tp_success_check = total_trades >= min_trade_history and current_tp_success_rate >= tp_success_threshold
+
+// Filter Check 2: TP1 Minimum Profit (TODO: Phase 2 - will be calculated from historical data)
+tp1_profit_check = true // Placeholder
+
+// Filter Check 3: Average Drawdown Limit
+drawdown_check = total_trades >= min_trade_history and current_avg_drawdown <= max_drawdown_limit
+
+// Overall Filter Status
+all_checks_pass = tp_success_check and tp1_profit_check and drawdown_check
+signal_approved = is_new_signal and all_checks_pass and validate_signal_strength(confidence_threshold)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                            DASHBOARD DISPLAY                                 │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Primary Status Display (TODO: Phase 3 - Enhanced dashboard implementation)
+dashboard_bg_color = all_checks_pass ? color.new(color.green, 90) : color.new(color.red, 90)
+text_color = all_checks_pass ? color.white : color.yellow
+
+// Status Indicators
+tp_success_display = current_tp_success_rate >= tp_success_threshold ?
+     "✅ TP Success Rate: PASS (" + str.tostring(current_tp_success_rate, "#.#") + "%)" :
+     "❌ TP Success Rate: FAIL (" + str.tostring(current_tp_success_rate, "#.#") + "%)"
+
+tp1_profit_display = tp1_profit_check ?
+     "✅ TP1 Minimum Profit: PASS" :
+     "❌ TP1 Minimum Profit: FAIL"
+
+drawdown_display = current_avg_drawdown <= max_drawdown_limit ?
+     "✅ Average Drawdown: PASS (" + str.tostring(current_avg_drawdown, "#.#") + "%)" :
+     "❌ Average Drawdown: FAIL (" + str.tostring(current_avg_drawdown, "#.#") + "%)"
+
+// Basic Dashboard (TODO: Phase 3 - Full implementation)
+if barstate.islast
+    dashboard_text = "🔔 Alerts: " + (alerts_enabled ? "ON" : "OFF") + "\n" +
+                     tp_success_display + "\n" +
+                     tp1_profit_display + "\n" +
+                     drawdown_display
+    
+    // Display dashboard in top-right corner
+    var label dashboard_label = na
+    label.delete(dashboard_label)
+    dashboard_label := label.new(
+         x=bar_index, y=high, 
+         text=dashboard_text, 
+         style=label.style_label_down,
+         color=dashboard_bg_color, 
+         textcolor=text_color,
+         size=size.small)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                               ALERT SYSTEM                                   │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Alert System (TODO: Phase 4 - Discord alert format implementation)
+if signal_approved and alerts_enabled
+    signal_type = is_buy_signal ? "BUY" : "SELL"
+    entry_price_formatted = format_price_display(close)
+    
+    // Basic alert (will be enhanced in Phase 4 with Discord formatting)
+    alert_text = "AO Optimiser Alert: " + signal_type + " signal for " + syminfo.ticker + 
+                " at " + entry_price_formatted
+    
+    alert(alert_text, alert.freq_once_per_bar)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                              VISUAL ELEMENTS                                 │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Chart Labels (TODO: Phase 4 - Enhanced visual system)
+if signal_approved
+    label_color = is_buy_signal ? color.new(color.green, 20) : color.new(color.red, 20)
+    label_text = is_buy_signal ? "Long" : "Short"
+    
+    label.new(bar_index, high, label_text, 
+              yloc=yloc.belowbar if is_buy_signal else yloc.abovebar,
+              color=color.new(#636363, 0), 
+              style=label.style_label_up if is_buy_signal else label.style_label_down,
+              textcolor=color.white, 
+              size=size.small)
+
+// Signal Plots (for development and debugging)
+plot(signal_direction, "External Signal", color=color.blue, display=display.data_window)
+plot(all_checks_pass ? 1 : 0, "Filter Status", color=color.orange, display=display.data_window)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                            DEVELOPMENT STATUS                                │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// DEVELOPMENT ROADMAP:
+//
+// PHASE 1: Core Engine (IN PROGRESS)
+// [ ] External signal ingestion system ✅ Basic implementation
+// [ ] Historical trade tracking (up to 100 trades) ✅ Array structure ready
+// [ ] Basic TP/SL calculation engine with format.mintick precision ✅ Basic framework
+// [ ] Sequence analysis (TP before SL logic) ⏳ TODO
+// [ ] Modular function architecture ✅ Structure in place
+//
+// PHASE 2: Statistical Analysis (PENDING)
+// [ ] Success rate calculations (90%, 70%, 50% TP levels)
+// [ ] Average drawdown computation
+// [ ] Continuous learning integration
+// [ ] +0.1% offset implementation with precise decimal handling
+// [ ] Efficient array management for trade data
+//
+// PHASE 3: Filter & Dashboard (PENDING)
+// [ ] Three-check filter system
+// [ ] Dashboard UI creation with formatted price displays
+// [ ] Pass/fail status indicators
+// [ ] Metrics display system using format.mintick
+//
+// PHASE 4: Alerts & Features (PENDING)
+// [ ] Discord alert formatting with dynamic price formatting
+// [ ] Custom alert system with placeholders and format.mintick
+// [ ] Cooldown mechanism
+// [ ] Chart label system with streamlined code
+//
+// PHASE 5: Code Optimization & Testing (PENDING)
+// [ ] Code refactoring for maintainability
+// [ ] Performance optimization without feature loss
+// [ ] Comprehensive testing across various decimal precision assets
+// [ ] Edge case handling and debugging
+// [ ] Final code cleanup and documentation  
