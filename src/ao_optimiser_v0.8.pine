@@ -1,0 +1,970 @@
+//@version=6
+strategy("AO Optimiser v0.8.0 - SMART FILTERING", "AO v0.8.0", overlay=true, max_bars_back=5000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║                    AO OPTIMISER v0.8.0 - SMART FILTERING                    ║
+// ║  - TP1: 90% success level (conservative)                                    ║
+// ║  - TP2: Average profit of TP1 winners OR 50th percentile fallback           ║
+// ║  - SL: Optimised (historical avg) OR Custom override                        ║
+// ║  - Only two user settings needed: TP1 level & success rate                  ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                              CORE SETTINGS                                   │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Signal Input
+external_signal_source = input.source(close, "📡 External Signal Source", group="🔌 Signal Input")
+// Signal validation always strict - no toggle needed
+
+// Trade Management - Position size set to 2% (user can adjust in Properties tab)
+
+// *** SIMPLIFIED: One control for when system goes live ***
+min_historical_trades = input.int(10, "🔬 Min Historical Trades", minval=5, maxval=50, step=1, group="🧠 Dynamic TP Analysis", tooltip="Minimum trades required before filters activate and system goes live")
+
+// *** MODE SELECTION: Optimised vs Custom ***
+filter_mode = input.string("Optimised", "🎯 Filter Mode", options=["Optimised", "Custom"], group="🎯 Smart Filtering", tooltip="Optimised: Auto-calculate all levels from data | Custom: Manual control")
+
+// CORE CONSTANTS - SMART SYSTEM
+TP1_TARGET_SUCCESS = 90  // TP1 hit by 90% of trades (conservative)
+// TP2 = Average profit of TP1 winners OR 50th percentile fallback
+// SL = Optimised (historical average) OR Custom user-defined
+
+// *** OPTIMISED MODE *** (No user inputs - all calculated from data)
+// TP1, TP2, SL, and Success Rate all auto-calculated for profitability
+
+// *** CUSTOM MODE *** (User Controls)
+tp1_success_threshold = input.int(90, "✅ TP1 Success Rate (%)", minval=50, maxval=100, step=5, group="🎯 Custom Mode", tooltip="Check 1: Minimum TP1 hit rate required")
+tp1_min_level = input.float(0.5, "💎 TP1 Min Level (%)", minval=0.1, maxval=5.0, step=0.1, group="🎯 Custom Mode", tooltip="Check 2: Minimum TP1 level threshold")
+max_drawdown_limit = input.float(2.1, "⚠️ Max Drawdown (%)", minval=0.5, maxval=10.0, step=0.1, group="🎯 Custom Mode", tooltip="Check 3: Maximum acceptable drawdown")
+// Check 4: Risk/Reward (SL < TP2) - AUTOMATIC, no user input needed
+
+// *** STOP LOSS: Auto-calculated in Optimised mode, User-defined in Custom mode ***
+
+// Exit Strategy
+tp1_exit_percent = input.float(50, "🎯 TP1 Exit (%)", minval=25, maxval=75, step=5, group="🎯 Smart Filtering", tooltip="Percentage to exit at TP1 (conservative target)")
+// Remaining percentage exits at TP2 (realistic target)
+
+// Historical Analysis - Always enabled for both modes
+
+// Operations
+entry_offset = input.float(0.1, "⏱️ Entry Offset (%)", minval=0.0, maxval=2.0, step=0.1, group="⚙️ Operations")
+cooldown_period = input.int(5, "🕐 Cooldown (bars)", minval=1, maxval=168, group="⚙️ Operations")
+alerts_enabled = input.bool(true, "🔔 Enable Alerts", group="⚙️ Operations")
+
+// System
+enable_strategy_trades = input.bool(true, "📈 Execute Trades", group="🛠️ System")
+show_dashboard = input.bool(true, "📱 Show Dashboard", group="🛠️ System")
+show_debug_plots = input.bool(true, "📊 Debug Plots", group="🛠️ System")
+enable_debug_labels = input.bool(true, "🔍 Debug Labels", group="🛠️ System", tooltip="Show debug info on chart")
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                     VARIABLE DECLARATIONS                                    │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// State tracking
+var int cooldown_bars_remaining = 0
+var string current_direction = ""
+var int last_closed_trades_count = 0
+
+// *** Entry tracking ***
+var float theoretical_entry_price = na
+var float actual_entry_price = na
+
+// *** SIMPLIFIED: Historical Price Movement Arrays (SYNCHRONIZED) ***
+var array<float> all_peak_moves = array.new<float>()
+var array<float> drawdown_history = array.new<float>()
+var array<float> peak_favorable_moves_long = array.new<float>()
+var array<float> peak_favorable_moves_short = array.new<float>()
+
+// *** Array synchronization counter (for tracking only) ***
+var int total_trades_recorded = 0
+
+// Current Trade Tracking
+var float max_drawdown_current = 0.0
+var float peak_favorable_move_current = 0.0
+var bool trade_data_collected = false
+var float current_favorable_move = 0.0
+var float current_drawdown = 0.0
+var float trade_tp1_used = na
+var float trade_tp2_used = na
+var float trade_sl_used = na
+
+// *** SIMPLIFIED: Dynamic TP Levels (Two Targets with Fallback) - FIXED TYPE DECLARATIONS ***
+var float calculated_tp1 = na
+var float calculated_tp2 = na
+var float calculated_sl = na  // Properly declared as float type
+var bool dynamic_levels_available = false
+var string tp2_method = na  // Track which method was used for TP2
+var string sl_method_used = na  // Track which SL method was used
+var float calculated_profitability = na  // Expected profitability % for optimised mode
+var float calculated_success_rate = na  // Expected success rate % for optimised mode
+
+// *** Signal confirmation tracking ***
+var int prev_confirmed_signal = 0
+
+// *** Validation split tracking ***
+var bool validation_data_available = false
+
+// *** SIMPLIFIED: TP/SL Level Variables (Two Targets) ***
+var float tp1_level = na
+var float tp2_level = na
+var float sl_level = na
+
+// Dashboard
+var table dashboard_table = na
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                           UTILITY FUNCTIONS                                  │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Safe string formatting
+safe_float_str(value) =>
+    na(value) ? "N/A" : str.tostring(value, "#.##")
+
+safe_int_str(value) =>
+    na(value) ? "N/A" : str.tostring(value)
+
+// Signal processing with confirmation - Always strict validation
+process_signal() =>
+    signal = external_signal_source
+    signal == 1 ? 1 : signal == -1 ? -1 : 0
+
+// *** Synchronized array operations ***
+validate_array_sync() =>
+    peak_size = array.size(all_peak_moves)
+    dd_size = array.size(drawdown_history)
+    peak_size == dd_size
+
+// Historical calculations for Smart Filtering System
+calculate_avg_drawdown() =>
+    size = array.size(drawdown_history)
+    if size == 0
+        0.0
+    else
+        total_dd = 0.0
+        for i = 0 to size - 1
+            total_dd += array.get(drawdown_history, i)
+        math.round(total_dd / size, 2)
+
+// *** NEW: Risk/Reward Check (SL < TP2) ***
+calculate_risk_reward_check() =>
+    not na(calculated_sl) and not na(calculated_tp2) and calculated_sl < calculated_tp2
+
+// *** SPLIT VALIDATION: Use second half for validation ***
+calculate_tp1_success_rate() =>
+    peak_moves_size = array.size(all_peak_moves)
+    if peak_moves_size < min_historical_trades * 2 or na(calculated_tp1)
+        0.0
+    else
+        // SPLIT: Use second half for validation only
+        validation_start_index = math.floor(peak_moves_size / 2)
+        success_count = 0
+        validation_count = 0
+        
+        for i = validation_start_index to peak_moves_size - 1
+            peak_move = array.get(all_peak_moves, i)
+            validation_count += 1
+            if peak_move >= calculated_tp1
+                success_count += 1
+        
+        validation_count > 0 ? math.round(success_count / validation_count * 100, 1) : 0.0
+
+// *** NEW: Calculate average profit of trades that hit TP1 (used for fallback decision) ***
+calculate_tp2_average_profit() =>
+    peak_moves_size = array.size(all_peak_moves)
+    if peak_moves_size < min_historical_trades * 2 or na(calculated_tp1)
+        na
+    else
+        // Use first half for TP2 calculation (same as TP1 calculation data)
+        calculation_end_index = math.floor(peak_moves_size / 2)
+        total_profit = 0.0
+        successful_trades = 0
+        
+        for i = 0 to calculation_end_index - 1
+            peak_move = array.get(all_peak_moves, i)
+            if peak_move >= calculated_tp1
+                total_profit += peak_move
+                successful_trades += 1
+        
+        if successful_trades > 0
+            math.round(total_profit / successful_trades, 2)
+        else
+            na
+
+// *** NEW: Calculate profitability using optimised levels ***
+calculate_optimised_profitability(tp1_level, tp2_level, sl_level) =>
+    peak_moves_size = array.size(all_peak_moves)
+    drawdown_size = array.size(drawdown_history)
+    
+    if peak_moves_size < min_historical_trades * 2 or drawdown_size != peak_moves_size
+        [na, na]  // [profitability, success_rate]
+    else
+        // Use first half for calculation (same as TP calculation data)
+        calculation_end_index = math.floor(peak_moves_size / 2)
+        
+        total_pnl = 0.0
+        successful_trades = 0
+        total_trades_simulated = 0
+        
+        for i = 0 to calculation_end_index - 1
+            peak_move = array.get(all_peak_moves, i)
+            max_dd = array.get(drawdown_history, i)
+            total_trades_simulated += 1
+            
+            // Simulate trade outcome
+            trade_pnl = 0.0
+            
+            if max_dd >= sl_level
+                // Hit stop loss first
+                trade_pnl := -sl_level
+            else if peak_move >= tp2_level
+                // Hit TP2 - full target
+                trade_pnl := (tp1_level * tp1_exit_percent / 100) + (tp2_level * (100 - tp1_exit_percent) / 100)
+                successful_trades += 1
+            else if peak_move >= tp1_level
+                // Hit TP1 only
+                trade_pnl := tp1_level * tp1_exit_percent / 100
+                successful_trades += 1
+            else
+                // No TP hit - assume breakeven or small loss
+                trade_pnl := -0.1  // Small slippage/fees
+            
+            total_pnl += trade_pnl
+        
+        if total_trades_simulated > 0
+            avg_pnl_per_trade = total_pnl / total_trades_simulated
+            success_rate = successful_trades / total_trades_simulated * 100
+            [avg_pnl_per_trade, success_rate]
+        else
+            [na, na]
+
+// *** Check if calculated TP1 meets minimum threshold - Custom mode only ***
+calculate_tp1_level_check() =>
+    if filter_mode == "Custom"
+        not na(calculated_tp1) and calculated_tp1 >= tp1_min_level
+    else
+        true  // Always pass in optimised mode
+
+// *** Check drawdown limit - Custom mode only ***
+calculate_drawdown_check() =>
+    if filter_mode == "Custom"
+        avg_dd = calculate_avg_drawdown()
+        avg_dd <= max_drawdown_limit
+    else
+        true  // Always pass in optimised mode - SL is auto-calculated
+
+// *** NEW: Check profitability - Optimised mode only ***
+calculate_profitability_check() =>
+    if filter_mode == "Optimised"
+        not na(calculated_profitability) and calculated_profitability > 0.2  // Minimum 0.2% average profit per trade
+    else
+        true  // Always pass in custom mode
+
+// Get data completeness percentage (for display only)
+get_data_completeness() =>
+    trade_count = array.size(all_peak_moves)
+    required_for_live = min_historical_trades * 2
+    math.min(100.0, trade_count / required_for_live * 100.0)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                 CORE ALGORITHM: SMART TP CALCULATION                         │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// *** NEW: Realistic Two-Target System with Fallback and Mode-dependent SL + Profitability ***
+calculate_dynamic_tp_levels() =>
+    total_moves = array.size(all_peak_moves)
+    
+    if total_moves < min_historical_trades * 2  // Require 2x minimum for split validation
+        [false, na, na, na, "INSUFFICIENT_DATA", "NO_DATA", na, na]
+    else
+        // SPLIT: Use only FIRST HALF for TP calculation
+        calculation_end_index = math.floor(total_moves / 2)
+        
+        // Create analysis array from FIRST HALF only
+        analysis_moves = array.new<float>()
+        for i = 0 to calculation_end_index - 1
+            array.push(analysis_moves, array.get(all_peak_moves, i))
+        
+        // Sort moves for percentile calculation (bubble sort)
+        moves_size = array.size(analysis_moves)
+        for i = 0 to moves_size - 2
+            for j = 0 to moves_size - 2 - i
+                if array.get(analysis_moves, j) > array.get(analysis_moves, j + 1)
+                    temp = array.get(analysis_moves, j)
+                    array.set(analysis_moves, j, array.get(analysis_moves, j + 1))
+                    array.set(analysis_moves, j + 1, temp)
+        
+        // *** TP1: 90% success level (conservative) ***
+        tp1_index = math.round((100.0 - TP1_TARGET_SUCCESS) / 100.0 * (moves_size - 1))
+        raw_tp1 = array.get(analysis_moves, tp1_index)
+        opt_tp1 = math.max(0.1, math.min(raw_tp1, 8.0))
+        
+        // *** TP2: Average profit of trades that hit TP1 (with fallback) ***
+        total_profit = 0.0
+        successful_trades = 0
+        for i = 0 to moves_size - 1
+            move = array.get(analysis_moves, i)
+            if move >= opt_tp1
+                total_profit += move
+                successful_trades += 1
+        
+        // Calculate average and check if it's meaningful
+        avg_profit = if successful_trades > 0
+            total_profit / successful_trades
+        else
+            0.0
+        
+        // *** FALLBACK LOGIC: Use 50th percentile if average isn't meaningful ***
+        // This prevents TP2 from being too close to TP1 when average is poor
+        tp2_method_used = ""
+        opt_tp2 = if avg_profit >= (opt_tp1 * 1.5) and successful_trades >= 3
+            // Average is meaningfully higher than TP1 (1.5x) and we have enough data (3+ trades)
+            tp2_method_used := "AVERAGE"
+            math.min(avg_profit, 25.0)
+        else
+            // Fallback to 50th percentile when average is too close to TP1
+            tp2_method_used := "50TH_PERCENTILE"
+            tp2_index = math.round(0.5 * (moves_size - 1))  // 50th percentile
+            raw_tp2 = array.get(analysis_moves, tp2_index)
+            math.max(opt_tp1 * 1.5, math.min(raw_tp2, 25.0))  // Ensure meaningful gap
+        
+        // *** STOP LOSS: Mode-dependent calculation ***
+        // Declare opt_sl with proper type that can handle na
+        float opt_sl = na
+        sl_method_used_local = ""
+        
+        if filter_mode == "Custom"
+            // Custom mode: Use max drawdown limit as SL
+            opt_sl := max_drawdown_limit
+            sl_method_used_local := "CUSTOM_DD_LIMIT"
+        else
+            // Optimised mode: Use historical average drawdown
+            avg_dd = calculate_avg_drawdown()
+            if avg_dd > 0.0
+                opt_sl := avg_dd
+                sl_method_used_local := "OPTIMISED"
+            else
+                // No drawdown data available - use conservative default
+                opt_sl := 2.0
+                sl_method_used_local := "DEFAULT"
+        
+        // Only return valid levels if we have valid SL
+        if na(opt_sl)
+            [false, na, na, na, "NO_SL_DATA", sl_method_used_local, na, na]
+        else
+            // Calculate profitability for optimised mode
+            float calc_profitability = na
+            float calc_success_rate = na
+            
+            if filter_mode == "Optimised"
+                [profit_result, success_result] = calculate_optimised_profitability(opt_tp1, opt_tp2, opt_sl)
+                calc_profitability := profit_result
+                calc_success_rate := success_result
+            
+            [true, opt_tp1, opt_tp2, opt_sl, tp2_method_used, sl_method_used_local, calc_profitability, calc_success_rate]
+
+// *** Synchronized trade history addition - Always enabled ***
+add_trade_to_history(peak_move, max_dd, direction) =>
+    // Add to all arrays atomically - always enabled for both modes
+    array.push(all_peak_moves, peak_move)
+    array.push(drawdown_history, max_dd)
+    
+    if direction == "LONG"
+        array.push(peak_favorable_moves_long, peak_move)
+    else
+        array.push(peak_favorable_moves_short, peak_move)
+    
+    // Synchronized trimming - all arrays stay aligned
+    max_history = 100
+    while array.size(all_peak_moves) > max_history
+        array.shift(all_peak_moves)
+        array.shift(drawdown_history)
+        // Only trim directional arrays if they have data
+        if array.size(peak_favorable_moves_long) > 0
+            array.shift(peak_favorable_moves_long)
+        if array.size(peak_favorable_moves_short) > 0
+            array.shift(peak_favorable_moves_short)
+    
+    true  // Return success
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                            MAIN LOGIC                                        │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// *** Signal processing with bar confirmation ***
+signal_direction = barstate.isconfirmed ? process_signal() : 0
+is_buy_signal = signal_direction == 1
+is_sell_signal = signal_direction == -1
+is_new_signal = false
+
+if barstate.isconfirmed
+    if signal_direction != 0 and signal_direction != prev_confirmed_signal
+        is_new_signal := true
+    prev_confirmed_signal := signal_direction
+
+// Update cooldown
+if cooldown_bars_remaining > 0
+    cooldown_bars_remaining -= 1
+
+// *** Calculate Dynamic TP Levels (Mode-dependent with Profitability) ***
+[has_dynamic_data, calc_tp1, calc_tp2, calc_sl, tp2_calc_method, sl_calc_method, calc_profitability, calc_success_rate] = calculate_dynamic_tp_levels()
+calculated_tp1 := calc_tp1
+calculated_tp2 := calc_tp2
+calculated_sl := calc_sl
+dynamic_levels_available := has_dynamic_data
+tp2_method := tp2_calc_method
+sl_method_used := sl_calc_method
+calculated_profitability := calc_profitability
+calculated_success_rate := calc_success_rate
+
+// Update validation data availability
+validation_data_available := array.size(all_peak_moves) >= min_historical_trades * 2
+
+// Performance metrics
+total_trades = strategy.closedtrades
+winning_trades = strategy.wintrades
+net_profit = strategy.netprofit
+historical_trades_count = array.size(all_peak_moves)
+avg_drawdown = calculate_avg_drawdown()  // Still calculated for display
+
+// *** MODE-DEPENDENT FILTERING SYSTEM ***
+// Declare three_checks_pass at proper scope
+var bool three_checks_pass = false
+
+if filter_mode == "Optimised"
+    // Optimised mode: Auto-calculated levels with profitability check
+    check1_profitability = calculate_profitability_check()  // Must be profitable
+    check2_risk_reward = calculate_risk_reward_check()      // SL < TP2 (positive expectancy)
+    check3_data_quality = validation_data_available and not na(calculated_tp1) and not na(calculated_tp2) and not na(calculated_sl)
+    
+    // Overall filter result for optimised mode
+    three_checks_pass := check1_profitability and check2_risk_reward and check3_data_quality
+else
+    // Custom mode: User-defined thresholds with historical validation
+    tp1_success_rate = calculate_tp1_success_rate()
+    check1_tp1_success = validation_data_available and tp1_success_rate >= tp1_success_threshold and not na(calculated_tp1)
+    check2_tp1_level = calculate_tp1_level_check()  // TP1 level meets minimum threshold
+    check3_drawdown = calculate_drawdown_check()    // Average drawdown within limit
+    check4_risk_reward = calculate_risk_reward_check()  // SL < TP2 (positive expectancy)
+    
+    // Overall filter result for custom mode
+    three_checks_pass := check1_tp1_success and check2_tp1_level and check3_drawdown and check4_risk_reward
+
+// Trade logic - WITH BOOTSTRAP MODE FOR INITIAL DATA COLLECTION
+show_signal_label = is_new_signal
+
+// Bootstrap mode: Allow initial trades to build historical data
+bootstrap_mode = historical_trades_count < min_historical_trades * 2  // Require 2x minimum for live mode
+execute_trade = if bootstrap_mode
+    // Bootstrap: Collect pure peak movement data using wide safety nets only
+    show_signal_label and enable_strategy_trades and cooldown_bars_remaining <= 0
+else
+    // Live mode: Use calculated TP levels from historical analysis
+    show_signal_label and three_checks_pass and enable_strategy_trades and cooldown_bars_remaining <= 0 and dynamic_levels_available
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                 STRATEGY EXECUTION & DATA COLLECTION                         │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Position tracking using actual strategy position
+actual_in_position = strategy.position_size != 0
+current_closed_trades = strategy.closedtrades
+
+// *** Strategy execution with proper entry tracking and confirmation ***
+if execute_trade and barstate.isconfirmed
+    if is_buy_signal
+        strategy.entry("Long", strategy.long, comment="Smart Filter Long")
+        theoretical_entry_price := close  // Clean price for TP/SL calculations
+        actual_entry_price := close * (1 + entry_offset / 100)  // Reality with slippage
+        current_direction := "LONG"
+        
+        // Initialize tracking for new trade
+        max_drawdown_current := 0.0
+        peak_favorable_move_current := 0.0
+        current_favorable_move := 0.0
+        current_drawdown := 0.0
+        trade_data_collected := false
+        trade_tp1_used := na
+        trade_tp2_used := na
+        trade_sl_used := na
+        
+        cooldown_bars_remaining := cooldown_period
+    
+    else if is_sell_signal
+        strategy.entry("Short", strategy.short, comment="Smart Filter Short")
+        theoretical_entry_price := close  // Clean price for TP/SL calculations
+        actual_entry_price := close * (1 - entry_offset / 100)  // Reality with slippage
+        current_direction := "SHORT"
+        
+        max_drawdown_current := 0.0
+        peak_favorable_move_current := 0.0
+        current_favorable_move := 0.0
+        current_drawdown := 0.0
+        trade_data_collected := false
+        trade_tp1_used := na
+        trade_tp2_used := na
+        trade_sl_used := na
+        
+        cooldown_bars_remaining := cooldown_period
+
+// *** Real-time position monitoring using theoretical entry price ***
+if actual_in_position and not na(theoretical_entry_price)
+    // Calculate current favorable move and drawdown using THEORETICAL entry
+    if current_direction == "LONG"
+        current_favorable_move := (high - theoretical_entry_price) / theoretical_entry_price * 100
+        current_drawdown := (theoretical_entry_price - low) / theoretical_entry_price * 100
+    else
+        current_favorable_move := (theoretical_entry_price - low) / theoretical_entry_price * 100
+        current_drawdown := (high - theoretical_entry_price) / theoretical_entry_price * 100
+    
+    // Update peak values
+    peak_favorable_move_current := math.max(peak_favorable_move_current, current_favorable_move)
+    max_drawdown_current := math.max(max_drawdown_current, current_drawdown)
+
+// *** SIMPLIFIED: Position management with Two Target levels ***
+if strategy.position_size > 0 and current_direction == "LONG" and not na(theoretical_entry_price)
+    // Use historical levels if available, otherwise let bootstrap trades run free
+    if dynamic_levels_available
+        // Historical analysis - use calculated two targets
+        tp1_level := theoretical_entry_price * (1 + calculated_tp1 / 100)
+        tp2_level := theoretical_entry_price * (1 + calculated_tp2 / 100)
+        sl_level := theoretical_entry_price * (1 - calculated_sl / 100)
+        
+        // Store levels for this trade
+        trade_tp1_used := calculated_tp1
+        trade_tp2_used := calculated_tp2
+        trade_sl_used := calculated_sl
+        
+        // *** TWO TARGET EXIT STRATEGY ***
+        strategy.exit("TP1_Long", "Long", limit=tp1_level, stop=sl_level, qty_percent=tp1_exit_percent)
+        strategy.exit("TP2_Long", "Long", limit=tp2_level, stop=sl_level, qty_percent=100)  // Remaining position
+    else
+        // Bootstrap mode: Use wide levels to capture natural peak moves
+        tp1_level := theoretical_entry_price * (1 + 20.0 / 100)  // Very high - won't interfere
+        tp2_level := theoretical_entry_price * (1 + 30.0 / 100)  // Very high - won't interfere
+        sl_level := theoretical_entry_price * (1 - 10.0 / 100)   // Wide stop loss
+        
+        // Store levels for this trade (but they're just safety nets)
+        trade_tp1_used := na  // No artificial TP1 during bootstrap
+        trade_tp2_used := na  // No artificial TP2 during bootstrap
+        trade_sl_used := 10.0
+        
+        // Use wide safety nets only
+        strategy.exit("Exit_Long", "Long", limit=tp2_level, stop=sl_level)
+
+if strategy.position_size < 0 and current_direction == "SHORT" and not na(theoretical_entry_price)
+    if dynamic_levels_available
+        // Historical analysis - use calculated two targets
+        tp1_level := theoretical_entry_price * (1 - calculated_tp1 / 100)
+        tp2_level := theoretical_entry_price * (1 - calculated_tp2 / 100)
+        sl_level := theoretical_entry_price * (1 + calculated_sl / 100)
+        
+        // Store levels for this trade
+        trade_tp1_used := calculated_tp1
+        trade_tp2_used := calculated_tp2
+        trade_sl_used := calculated_sl
+        
+        // *** TWO TARGET EXIT STRATEGY ***
+        strategy.exit("TP1_Short", "Short", limit=tp1_level, stop=sl_level, qty_percent=tp1_exit_percent)
+        strategy.exit("TP2_Short", "Short", limit=tp2_level, stop=sl_level, qty_percent=100)  // Remaining position
+    else
+        // Bootstrap mode: Use wide levels to capture natural peak moves
+        tp1_level := theoretical_entry_price * (1 - 20.0 / 100)  // Very low - won't interfere
+        tp2_level := theoretical_entry_price * (1 - 30.0 / 100)  // Very low - won't interfere
+        sl_level := theoretical_entry_price * (1 + 10.0 / 100)   // Wide stop loss
+        
+        // Store levels for this trade (but they're just safety nets)
+        trade_tp1_used := na  // No artificial TP1 during bootstrap
+        trade_tp2_used := na  // No artificial TP2 during bootstrap
+        trade_sl_used := 10.0
+        
+        // Use wide safety nets only
+        strategy.exit("Exit_Short", "Short", limit=tp2_level, stop=sl_level)
+
+// Trade completion detection and data collection
+if current_closed_trades > last_closed_trades_count and not trade_data_collected
+    // *** CRITICAL: Collect historical data when trade closes ***
+    if peak_favorable_move_current > 0.0  // Valid data collected
+        trade_added_successfully = add_trade_to_history(peak_favorable_move_current, max_drawdown_current, current_direction)
+        if trade_added_successfully
+            total_trades_recorded := total_trades_recorded + 1
+            trade_data_collected := true
+            
+            // Validate synchronization
+            if not validate_array_sync()
+                // Arrays are out of sync - this shouldn't happen but log it
+                if enable_debug_labels
+                    label.new(bar_index, high, "ARRAY SYNC ERROR!", color=color.red, textcolor=color.white, size=size.small)
+        
+        // Debug verification with detailed info
+        if enable_debug_labels and trade_data_collected
+            debug_text = "DATA COLLECTED\nPeak: " + str.tostring(peak_favorable_move_current, "#.##") + "%\nDD: " + str.tostring(max_drawdown_current, "#.##") + "%"
+            label.new(bar_index, high, debug_text, style=label.style_label_down, color=color.green, textcolor=color.white, size=size.small)
+    
+    last_closed_trades_count := current_closed_trades
+
+// Reset tracking when no position
+if not actual_in_position and not na(theoretical_entry_price)
+    theoretical_entry_price := na
+    actual_entry_price := na
+    current_direction := ""
+    max_drawdown_current := 0.0
+    peak_favorable_move_current := 0.0
+    current_favorable_move := 0.0
+    current_drawdown := 0.0
+    trade_data_collected := false
+    trade_tp1_used := na
+    trade_tp2_used := na
+    trade_sl_used := na
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                    DASHBOARD WITH SMART FILTERING FOCUS                      │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Create dashboard
+if show_dashboard and (is_new_signal or barstate.islast)
+    var table pro_dashboard = na
+    if not na(pro_dashboard)
+        table.delete(pro_dashboard)
+    
+    pro_dashboard := table.new(position.top_right, 3, 14, bgcolor=color.new(#0a0a0a, 5), border_width=1, border_color=color.new(#2a2a2a, 50))
+    
+    // Color scheme
+    header_bg = color.new(#1a1a1a, 0)
+    data_bg = color.new(#0f0f0f, 0)
+    text_primary = color.new(#ffffff, 0)
+    text_secondary = color.new(#888888, 0)
+    var_green = color.new(#10b981, 0)
+    var_red = color.new(#ef4444, 0)
+    var_blue = color.new(#3b82f6, 0)
+    var_yellow = color.new(#f59e0b, 0)
+    
+    // Safe data preparation
+    total_trades_safe = na(total_trades) ? 0 : total_trades
+    historical_count = array.size(all_peak_moves)
+    data_completeness = get_data_completeness()
+    
+    // Status indicators
+    main_status = if bootstrap_mode
+        "BOOTSTRAP"
+    else
+        three_checks_pass ? "ACTIVE" : "FILTERED"
+    
+    main_status_color = if bootstrap_mode
+        var_yellow
+    else
+        three_checks_pass ? var_green : var_red
+    
+    // Data quality indicators
+    data_quality_color = data_completeness >= 100 ? var_green : data_completeness >= 50 ? var_yellow : var_red
+    data_quality_text = data_completeness >= 100 ? "READY" : data_completeness >= 50 ? "PARTIAL" : "BUILDING"
+    
+    // ROW 0: SYSTEM Header
+    table.cell(pro_dashboard, 0, 0, "🔧 SYSTEM", bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 0, "STATUS", bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 0, main_status, bgcolor=main_status_color, text_color=text_primary, text_size=size.small)
+    
+    // ROW 1: Signal Details
+    signal_type_color = is_buy_signal ? var_green : var_red
+    signal_text = is_buy_signal ? "BUY" : "SELL"
+    
+    table.cell(pro_dashboard, 0, 1, "Signal Type", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 1, signal_text, bgcolor=signal_type_color, text_color=text_primary, text_size=size.small)
+    
+    mode_text = bootstrap_mode ? "BOOTSTRAP" : "LIVE"
+    mode_color = bootstrap_mode ? var_yellow : data_bg
+    mode_cell_text = "Mode: " + mode_text
+    table.cell(pro_dashboard, 2, 1, mode_cell_text, bgcolor=mode_color, text_color=text_primary, text_size=size.small)
+    
+    // ROW 2: DATA QUALITY Header
+    table.cell(pro_dashboard, 0, 2, "📊 DATA QUALITY", bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 2, "STATUS", bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 2, data_quality_text, bgcolor=data_quality_color, text_color=text_primary, text_size=size.small)
+    
+    // ROW 3: Historical Data / Bootstrap Progress
+    progress_text = ""
+    if bootstrap_mode
+        progress_text := str.tostring(historical_count) + "/" + str.tostring(min_historical_trades * 2) + " for live"
+    else
+        progress_text := "Data: " + str.tostring(data_completeness, "#") + "% complete"
+    
+    table.cell(pro_dashboard, 0, 3, "Historical Trades", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 3, safe_int_str(historical_count), bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 3, progress_text, bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+    
+    // ROW 4: Analysis Method
+    method_color = dynamic_levels_available ? var_green : var_yellow
+    method_text = dynamic_levels_available ? "HISTORICAL" : "BOOTSTRAP"
+    
+    // Calculate analysis window size
+    analysis_window = if bootstrap_mode
+        historical_count
+    else
+        math.floor(historical_count / 2)  // Show calculation window size
+    
+    table.cell(pro_dashboard, 0, 4, "Analysis Method", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 4, method_text, bgcolor=method_color, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 4, "Window: " + str.tostring(analysis_window), bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+    
+    // ROW 5: TWO TARGET SYSTEM Header
+    table.cell(pro_dashboard, 0, 5, "🎯 TWO TARGETS", bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 5, "TYPE", bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 5, "VALUE", bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    
+    // ROW 6: TP1 - Conservative Target
+    tp1_value_text = "+" + safe_float_str(calculated_tp1) + "%"
+    table.cell(pro_dashboard, 0, 6, "🏆 TP1 (90%)", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 6, "Conservative", bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 6, tp1_value_text, bgcolor=var_green, text_color=text_primary, text_size=size.small)
+    
+    // ROW 7: TP2 - Realistic Target (with method indicator)
+    tp2_method_display = if tp2_method == "AVERAGE"
+        "Average"
+    else if tp2_method == "50TH_PERCENTILE"
+        "50th %ile"
+    else
+        "Calculating"
+    
+    tp2_bg_color = if tp2_method == "AVERAGE"
+        var_blue
+    else if tp2_method == "50TH_PERCENTILE"
+        var_yellow
+    else
+        data_bg
+    
+    tp2_cell_text = "🎯 TP2 (" + tp2_method_display + ")"
+    tp2_value_text = "+" + safe_float_str(calculated_tp2) + "%"
+    
+    table.cell(pro_dashboard, 0, 7, tp2_cell_text, bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 7, "Realistic", bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 7, tp2_value_text, bgcolor=tp2_bg_color, text_color=text_primary, text_size=size.small)
+    
+    // ROW 8: Stop Loss (with method indicator)
+    sl_method_display = if sl_method_used == "OPTIMISED"
+        "Optimised"
+    else if sl_method_used == "CUSTOM_DD_LIMIT"
+        "DD Limit"
+    else if sl_method_used == "DEFAULT"
+        "Default"
+    else
+        "Calculating"
+    
+    sl_bg_color = if sl_method_used == "OPTIMISED"
+        var_red
+    else if sl_method_used == "CUSTOM_DD_LIMIT"
+        color.new(#8b5cf6, 0)  // Purple for custom DD limit
+    else if sl_method_used == "DEFAULT"
+        color.new(#f59e0b, 0)  // Orange for default
+    else
+        data_bg
+    
+    sl_cell_text = "🛡️ SL (" + sl_method_display + ")"
+    sl_value_text = "-" + safe_float_str(calculated_sl) + "%"
+    table.cell(pro_dashboard, 0, 8, sl_cell_text, bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 8, "Risk Control", bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 8, sl_value_text, bgcolor=sl_bg_color, text_color=text_primary, text_size=size.small)
+    
+    // ROW 9: MODE-DEPENDENT FILTERING Header
+    filter_header = filter_mode == "Optimised" ? "⚡ OPTIMISED FILTERING" : "✅ CUSTOM FILTERING"
+    table.cell(pro_dashboard, 0, 9, filter_header, bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 9, "STATUS", bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 9, "VALUE", bgcolor=header_bg, text_color=text_primary, text_size=size.small)
+    
+    if filter_mode == "Optimised"
+        // OPTIMISED MODE: Show profitability, risk/reward, and data quality
+        
+        // ROW 10: Check 1 - Profitability
+        check1_color = if not validation_data_available
+            var_yellow
+        else
+            calculate_profitability_check() ? var_green : var_red
+        check1_text = if not validation_data_available
+            "WAIT"
+        else
+            calculate_profitability_check() ? "PASS" : "FAIL"
+        
+        check1_value_text = if na(calculated_profitability)
+            "Calculating..."
+        else
+            "+" + str.tostring(calculated_profitability, "#.##") + "%/trade"
+        
+        table.cell(pro_dashboard, 0, 10, "1. Profitability", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+        table.cell(pro_dashboard, 1, 10, check1_text, bgcolor=check1_color, text_color=text_primary, text_size=size.small)
+        table.cell(pro_dashboard, 2, 10, check1_value_text, bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+        
+        // ROW 11: Check 2 - Risk/Reward
+        check2_color = if not validation_data_available
+            var_yellow
+        else
+            calculate_risk_reward_check() ? var_green : var_red
+        check2_text = if not validation_data_available
+            "WAIT"
+        else
+            calculate_risk_reward_check() ? "PASS" : "FAIL"
+        
+        risk_reward_display = if na(calculated_sl) or na(calculated_tp2)
+            "Calculating..."
+        else
+            str.tostring(calculated_sl, "#.##") + " < " + str.tostring(calculated_tp2, "#.##")
+        
+        table.cell(pro_dashboard, 0, 11, "2. Risk/Reward", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+        table.cell(pro_dashboard, 1, 11, check2_text, bgcolor=check2_color, text_color=text_primary, text_size=size.small)
+        table.cell(pro_dashboard, 2, 11, risk_reward_display, bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+        
+        // ROW 12: Check 3 - Expected Success Rate
+        check3_color = if not validation_data_available
+            var_yellow
+        else
+            not na(calculated_success_rate) ? var_green : var_red
+        check3_text = if not validation_data_available
+            "WAIT"
+        else
+            not na(calculated_success_rate) ? "READY" : "CALC"
+        
+        check3_value_text = if na(calculated_success_rate)
+            "Calculating..."
+        else
+            str.tostring(calculated_success_rate, "#.#") + "% expected"
+        
+        table.cell(pro_dashboard, 0, 12, "3. Success Rate", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+        table.cell(pro_dashboard, 1, 12, check3_text, bgcolor=check3_color, text_color=text_primary, text_size=size.small)
+        table.cell(pro_dashboard, 2, 12, check3_value_text, bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+    else
+        // CUSTOM MODE: Show traditional checks
+        tp1_success_rate = calculate_tp1_success_rate()
+        
+        // ROW 10: Check 1 - TP1 Success Rate (SPLIT VALIDATION)
+        check1_color = if not validation_data_available
+            var_yellow
+        else
+            (validation_data_available and tp1_success_rate >= tp1_success_threshold and not na(calculated_tp1)) ? var_green : var_red
+        check1_text = if not validation_data_available
+            "WAIT"
+        else
+            (validation_data_available and tp1_success_rate >= tp1_success_threshold and not na(calculated_tp1)) ? "PASS" : "FAIL"
+        
+        check1_value_text = safe_float_str(tp1_success_rate) + "%"
+        table.cell(pro_dashboard, 0, 10, "1. TP1 Success", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+        table.cell(pro_dashboard, 1, 10, check1_text, bgcolor=check1_color, text_color=text_primary, text_size=size.small)
+        table.cell(pro_dashboard, 2, 10, check1_value_text, bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+        
+        // ROW 11: Check 2 - TP1 Level
+        check2_color = if not validation_data_available
+            var_yellow
+        else
+            calculate_tp1_level_check() ? var_green : var_red
+        check2_text = if not validation_data_available
+            "WAIT"
+        else
+            calculate_tp1_level_check() ? "PASS" : "FAIL"
+        
+        check2_value_text = safe_float_str(calculated_tp1) + "%"
+        table.cell(pro_dashboard, 0, 11, "2. TP1 Level", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+        table.cell(pro_dashboard, 1, 11, check2_text, bgcolor=check2_color, text_color=text_primary, text_size=size.small)
+        table.cell(pro_dashboard, 2, 11, check2_value_text, bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+        
+        // ROW 12: Check 3 - Drawdown Limit
+        check3_color = if not validation_data_available
+            var_yellow
+        else
+            calculate_drawdown_check() ? var_green : var_red
+        check3_text = if not validation_data_available
+            "WAIT"
+        else
+            calculate_drawdown_check() ? "PASS" : "FAIL"
+        
+        drawdown_display = str.tostring(avg_drawdown, "#.##") + " ≤ " + str.tostring(max_drawdown_limit, "#.##")
+        table.cell(pro_dashboard, 0, 12, "3. Drawdown", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+        table.cell(pro_dashboard, 1, 12, check3_text, bgcolor=check3_color, text_color=text_primary, text_size=size.small)
+        table.cell(pro_dashboard, 2, 12, drawdown_display, bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+    
+    // ROW 13: PERFORMANCE Header & Strategy Performance
+    profit_color = net_profit > 0 ? var_green : net_profit < 0 ? var_red : data_bg
+    trades_text = safe_int_str(total_trades_safe) + " trades"
+    
+    table.cell(pro_dashboard, 0, 13, "📈 P&L", bgcolor=data_bg, text_color=text_secondary, text_size=size.small)
+    table.cell(pro_dashboard, 1, 13, safe_float_str(net_profit), bgcolor=profit_color, text_color=text_primary, text_size=size.small)
+    table.cell(pro_dashboard, 2, 13, trades_text, bgcolor=data_bg, text_color=text_primary, text_size=size.small)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                              VISUAL ELEMENTS                                 │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// Chart labels - Simple LONG/SHORT in grey
+if show_signal_label
+    label_color = color.new(color.gray, 20)
+    label_text = is_buy_signal ? "LONG" : "SHORT"
+    label_yloc = is_buy_signal ? yloc.belowbar : yloc.abovebar
+    label_style = is_buy_signal ? label.style_label_up : label.style_label_down
+    
+    label.new(bar_index, high, label_text, yloc=label_yloc, color=label_color, style=label_style, textcolor=color.white, size=size.small)
+
+// Debug label for TP2 method (when enabled)
+if enable_debug_labels and barstate.islast and not na(tp2_method)
+    tp2_debug_text = "TP2 METHOD: " + tp2_method + "\nTP1: " + str.tostring(calculated_tp1, "#.##") + "%\nTP2: " + str.tostring(calculated_tp2, "#.##") + "%"
+    if tp2_method == "50TH_PERCENTILE"
+        tp2_debug_text := tp2_debug_text + "\n(Average was too close to TP1)"
+    
+    label.new(bar_index, low * 0.995, tp2_debug_text, style=label.style_label_up, color=color.blue, textcolor=color.white, size=size.small)
+
+// Debug label for SL method (when enabled)
+if enable_debug_labels and barstate.islast and not na(sl_method_used)
+    sl_debug_text = "SL METHOD: " + sl_method_used + "\nSL: " + str.tostring(calculated_sl, "#.##") + "%"
+    if sl_method_used == "CUSTOM_DD_LIMIT"
+        sl_debug_text := sl_debug_text + "\n(DD Limit: " + str.tostring(max_drawdown_limit, "#.##") + "%)"
+    else if sl_method_used == "OPTIMISED"
+        avg_dd = calculate_avg_drawdown()
+        sl_debug_text := sl_debug_text + "\n(Historical avg: " + str.tostring(avg_dd, "#.##") + "%)"
+    else if sl_method_used == "DEFAULT"
+        sl_debug_text := sl_debug_text + "\n(Default conservative: 2.0%)"
+    
+    label.new(bar_index, low * 0.99, sl_debug_text, style=label.style_label_up, color=color.purple, textcolor=color.white, size=size.small)
+
+// Debug label for mode and profitability (when enabled)
+if enable_debug_labels and barstate.islast and filter_mode == "Optimised" and not na(calculated_profitability)
+    profitability_debug_text = "OPTIMISED MODE\nProfitability: " + str.tostring(calculated_profitability, "#.##") + "%/trade\nSuccess Rate: " + str.tostring(calculated_success_rate, "#.#") + "%"
+    label.new(bar_index, low * 0.985, profitability_debug_text, style=label.style_label_up, color=color.teal, textcolor=color.white, size=size.small)
+
+// Alert system
+if execute_trade and alerts_enabled
+    signal_type = is_buy_signal ? "BUY" : "SELL"
+    entry_price_formatted = str.tostring(close, format.mintick)
+    
+    tp2_method_text = ""
+    if tp2_method == "AVERAGE"
+        tp2_method_text := "Average Target"
+    else if tp2_method == "50TH_PERCENTILE"
+        tp2_method_text := "50th Percentile"
+    else
+        tp2_method_text := "Calculated Target"
+    
+    // Build alert text - simplified approach to avoid string issues
+    alert_text = "AO OPTIMISER v0.8.0 - " + filter_mode + " MODE | " + signal_type + " " + syminfo.ticker + " @ " + entry_price_formatted + " | TP1: " + str.tostring(calculated_tp1, "#.#") + "% | TP2: " + str.tostring(calculated_tp2, "#.#") + "% | SL: " + str.tostring(calculated_sl, "#.#") + "%"
+    
+    // Add mode-specific suffix
+    if filter_mode == "Optimised"
+        if not na(calculated_profitability)
+            alert_text := alert_text + " | Profit: " + str.tostring(calculated_profitability, "#.##") + "%/trade"
+    
+    alert(alert_text, alert.freq_once_per_bar)
+
+// ┌──────────────────────────────────────────────────────────────────────────────┐
+// │                              DEBUG SYSTEM                                    │
+// └──────────────────────────────────────────────────────────────────────────────┘
+
+// CRITICAL DEBUG PLOTS
+plot(show_debug_plots ? strategy.closedtrades : na, "Strategy Closed Trades", color=color.red, display=display.data_window)
+plot(show_debug_plots ? array.size(all_peak_moves) : na, "Peak Moves Array Size", color=color.purple, display=display.data_window)
+plot(show_debug_plots ? (validation_data_available ? 1 : 0) : na, "Validation Data Available", color=color.blue, display=display.data_window)
+plot(show_debug_plots ? (execute_trade ? 1 : 0) : na, "Execute Trade", color=color.white, display=display.data_window)
+plot(show_debug_plots ? (three_checks_pass ? 1 : 0) : na, "All Checks Pass", color=color.fuchsia, display=display.data_window)
+plot(show_debug_plots ? (bootstrap_mode ? 1 : 0) : na, "Bootstrap Mode", color=color.yellow, display=display.data_window)
+plot(show_debug_plots ? (filter_mode == "Optimised" ? 1 : 0) : na, "Optimised Mode", color=color.aqua, display=display.data_window)
+plot(show_debug_plots ? calculated_tp1 : na, "TP1 (Conservative)", color=color.lime, display=display.data_window)
+plot(show_debug_plots ? calculated_tp2 : na, "TP2 (Realistic)", color=color.orange, display=display.data_window)
+plot(show_debug_plots ? calculated_sl : na, "Stop Loss", color=color.red, display=display.data_window)
+plot(show_debug_plots ? calculated_profitability : na, "Expected Profitability %", color=color.teal, display=display.data_window)
+plot(show_debug_plots ? calculated_success_rate : na, "Expected Success Rate %", color=color.navy, display=display.data_window)
+plot(show_debug_plots ? (tp2_method == "AVERAGE" ? 1 : 0) : na, "TP2 Using Average", color=color.blue, display=display.data_window)
+plot(show_debug_plots ? (tp2_method == "50TH_PERCENTILE" ? 1 : 0) : na, "TP2 Using 50th Percentile", color=color.yellow, display=display.data_window)
