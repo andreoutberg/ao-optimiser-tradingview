@@ -2,9 +2,6 @@
 
 ## 📋 **UPDATED CHANGELOG.md**
 
-Add this entry to the top of your CHANGELOG.md:
-
-```markdown
 ## [v0.8.0] - 2025-01-09 - Dual Mode System with Profitability Validation
 
 ### 🎉 Major Milestone: Advanced Statistical Analysis Implementation
